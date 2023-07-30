@@ -1,0 +1,195 @@
+#pragma once
+
+void rot(inout float2 p, float a)
+{
+    p = mul(float2x2(cos(a), sin(a), -sin(a), cos(a)), p);
+}
+
+float sdSphere(float3 p, float r)
+{
+    return length(p) - r;
+}
+
+float sdBox(float3 p, float3 b)
+{
+    float3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float dMenger(float3 z0, float3 offset, float scale, inout float4 ifsPosition)
+{
+    float4 z = float4(z0, 1.0);
+    [loop]
+    for (int n = 0; n < 4; n++)
+    {
+        z = abs(z);
+
+        if (z.x < z.y)
+        {
+            z.xy = z.yx;
+        }
+
+        if (z.x < z.z)
+        {
+            z.xz = z.zx;
+        }
+
+        if (z.y < z.z)
+        {
+            z.yz = z.zy;
+        }
+
+        z *= scale;
+        z.xyz -= offset * (scale - 1.0);
+
+        if (z.z < - 0.5 * offset.z * (scale - 1.0))
+        {
+            z.z += offset.z * (scale - 1.0);
+        }
+    }
+
+    ifsPosition = z;
+
+    return (length(max(abs(z.xyz) - float3(1.0, 1.0, 1.0), 0.0)) - 0.05) / z.w;
+}
+
+float map(float3 pos, float uniformScale, float3 mengerOffst, float mengerScale, inout float4 ifsPosition)
+{
+    pos /= uniformScale;
+
+    float d = dMenger(pos, mengerOffst, mengerScale, ifsPosition);
+    d *= uniformScale;
+
+    return d;
+}
+
+// 偏微分から法線を計算します
+float3 calcNormal(float3 p, float uniformScale, float3 mengerOffst, float mengerScale, inout float4 ifsPosition)
+{
+    float eps = 0.001;
+
+    return normalize(float3(
+        map(p + float3(eps, 0.0, 0.0), uniformScale, mengerOffst, mengerScale, ifsPosition) - map(p + float3(-eps, 0.0, 0.0), uniformScale, mengerOffst, mengerScale, ifsPosition),
+        map(p + float3(0.0, eps, 0.0), uniformScale, mengerOffst, mengerScale, ifsPosition) - map(p + float3(0.0, -eps, 0.0), uniformScale, mengerOffst, mengerScale, ifsPosition),
+        map(p + float3(0.0, 0.0, eps), uniformScale, mengerOffst, mengerScale, ifsPosition) - map(p + float3(0.0, 0.0, -eps), uniformScale, mengerOffst, mengerScale, ifsPosition)
+    ));
+}
+
+float calcAO(float3 pos, float3 nor, float uniformScale, float3 mengerOffst, float mengerScale, inout float4 ifsPosition)
+{
+    float occ = 0.0;
+    float sca = 1.0;
+
+    for (int i = 0; i < 5; i++)
+    {
+        float h = 0.01 + 0.12 * float(i) / 4.0;
+        float d = map(pos + h * nor, uniformScale, mengerOffst, mengerScale, ifsPosition);
+        occ += (h - d) * sca;
+        sca *= 0.95;
+        if (occ > 0.35) break;
+    }
+
+    return saturate(clamp(1.0 - 3.0 * occ, 0.0, 1.0) * (0.5 + 0.5 * nor.y));
+}
+
+//
+float calcEdge(float3 p, float uniformScale, float3 mengerOffst, float mengerScale, inout float4 ifsPosition) {
+    float edge = 0.0;
+    float2 e = float2(0.01, 0);
+
+    // Take some distance function measurements from either side of the hit point on all three axes.
+	float d1 = map(p + e.xyy, uniformScale, mengerOffst, mengerScale, ifsPosition), d2 = map(p - e.xyy, uniformScale, mengerOffst, mengerScale, ifsPosition);
+	float d3 = map(p + e.yxy, uniformScale, mengerOffst, mengerScale, ifsPosition), d4 = map(p - e.yxy, uniformScale, mengerOffst, mengerScale, ifsPosition);
+	float d5 = map(p + e.yyx, uniformScale, mengerOffst, mengerScale, ifsPosition), d6 = map(p - e.yyx, uniformScale, mengerOffst, mengerScale, ifsPosition);
+	float d = map(p, uniformScale, mengerOffst, mengerScale, ifsPosition) * 2.;	// The hit point itself - Doubled to cut down on calculations. See below.
+
+    // Edges - Take a geometry measurement from either side of the hit point. Average them, then see how
+    // much the value differs from the hit point itself. Do this for X, Y and Z directions. Here, the sum
+    // is used for the overall difference, but there are other ways. Note that it's mainly sharp surface
+    // curves that register a discernible difference.
+    edge = abs(d1 + d2 - d) + abs(d3 + d4 - d) + abs(d5 + d6 - d);
+    //edge = max(max(abs(d1 + d2 - d), abs(d3 + d4 - d)), abs(d5 + d6 - d)); // Etc.
+
+    // Once you have an edge value, it needs to normalized, and smoothed if possible. How you
+    // do that is up to you. This is what I came up with for now, but I might tweak it later.
+    edge = smoothstep(0., 1., sqrt(edge/e.x*2.));
+
+    // Return the normal.
+    // Standard, normalized gradient mearsurement.
+    return edge;
+}
+
+/*
+// http://iquilezles.org/www/articles/rmshadows/rmshadows.htm
+float calcSoftshadow(float3 ro, float3 rd, float mint, float tmax, float uniformScale, float3 mengerOffst, float mengerScale)
+{
+    // bounding volume
+    float tp = (0.8 - ro.y) / rd.y;
+    if (tp > 0.0) tmax = min(tmax, tp);
+
+    float res = 1.0;
+    float t = mint;
+    for (int i = 0; i < 24; i++)
+    {
+        float h = map(ro + rd * t, uniformScale, mengerOffst, mengerScale);
+        float s = clamp(8.0 * h / t, 0.0, 1.0);
+        res = min(res, s * s * (3.0 - 2.0 * s));
+        t += clamp(h, 0.02, 0.2);
+        if (res < 0.004 || t > tmax) break;
+    }
+    return clamp(res, 0.0, 1.0);
+}*/
+
+float isInsideCube(float3 p)
+{
+    return sdBox(p, (50).xxx) <= 0;
+}
+
+void raymarching(
+    float3 origin, float3 ray, int raymarchingLoop,
+    float uniformScale, float3 mengerOffst, float mengerScale,
+    inout float hit, inout float depth, inout float3 hitPosition, inout float4 ifsPosition,
+    inout float3 albedo, inout float3 normal, inout float ao, inout float emissive
+)
+{
+    // レイマーチング
+    hit = 0;
+    depth = 0.0;// レイの進んだ距離
+    float3 p = origin;// レイの先端の座標
+    int i = 0;// レイマーチングのループカウンター
+
+    [loop]
+    for (i = 0; i < raymarchingLoop; i++)
+    {
+        float d = map(p, uniformScale, mengerOffst, mengerScale, ifsPosition);
+
+        // 最短距離を0に近似できるなら、オブジェクトに衝突したとみなして、ループを抜けます
+        if (abs(d) < 0.1)
+        {
+            // hit = 1;
+            break;
+        }
+
+        depth += d;// 最短距離だけレイを進めます
+        p = origin + ray * depth;// レイの先端の座標を更新します
+    }
+
+    hit = isInsideCube(p);
+    hitPosition = p;
+
+    float4 _ifsPosition;
+
+    if (hit)
+    {
+        // ライティングのパラメーター
+        normal = calcNormal(p, uniformScale, mengerOffst, mengerScale, _ifsPosition);// 法線
+        emissive = calcEdge(p, uniformScale, mengerOffst, mengerScale, _ifsPosition);// エッジ
+        ao = calcAO(p, normal, uniformScale, mengerOffst, mengerScale, _ifsPosition);// AO
+        // float shadow = calcSoftshadow(p, light, 0.025, 1);// シャドウ
+    }
+    else
+    {
+        albedo = float3(0, 0, 0);
+        discard;
+    }
+}
